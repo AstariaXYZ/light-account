@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0
-pragma solidity ^0.8.21;
+pragma solidity ^0.8.17;
 
 /* solhint-disable avoid-low-level-calls */
 /* solhint-disable no-inline-assembly */
 /* solhint-disable reason-string */
 
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
-import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
-import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+
+import {LibClone} from "solady/src/utils/LibClone.sol";
+import {ECDSA} from "solady/src/utils/ECDSA.sol";
+import {UUPSUpgradeable} from "solady/src/utils/UUPSUpgradeable.sol";
+import {SignatureCheckerLib} from "solady/src/utils/SignatureCheckerLib.sol";
 
 import {BaseAccount} from "account-abstraction/core/BaseAccount.sol";
 import {IEntryPoint} from "account-abstraction/interfaces/IEntryPoint.sol";
@@ -16,6 +18,9 @@ import {UserOperation} from "account-abstraction/interfaces/UserOperation.sol";
 import {TokenCallbackHandler} from "account-abstraction/samples/callback/TokenCallbackHandler.sol";
 
 import {CustomSlotInitializable} from "./CustomSlotInitializable.sol";
+import {LightAccountFactory} from "./LightAccountFactory.sol";
+
+import {MockSP} from "test/mocks/MockSP.sol";
 
 /**
  * @title A simple ERC-4337 compatible smart contract account with a designated owner account
@@ -64,24 +69,11 @@ contract LightAccount is BaseAccount, TokenCallbackHandler, UUPSUpgradeable, Cus
     // keccak256("LightAccountMessage(bytes message)");
     bytes32 private constant LA_MSG_TYPEHASH = 0x5e3baca2936049843f06038876a12f03627b5edc98025751ecf2ac7562640199;
 
+    LightAccountFactory public immutable factory;
+
     struct LightAccountStorage {
         address owner;
     }
-
-    /**
-     * @notice Emitted when this account is first initialized
-     * @param entryPoint The entry point
-     * @param owner The initial owner
-     */
-    event LightAccountInitialized(IEntryPoint indexed entryPoint, address indexed owner);
-
-    /**
-     * @notice Emitted when this account's owner changes. Also emitted once at
-     * initialization, with a `previousOwner` of 0.
-     * @param previousOwner The previous owner
-     * @param newOwner The new owner
-     */
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     /**
      * @dev The length of the array does not match the expected length.
@@ -89,23 +81,28 @@ contract LightAccount is BaseAccount, TokenCallbackHandler, UUPSUpgradeable, Cus
     error ArrayLengthMismatch();
 
     /**
-     * @dev The new owner is not a valid owner (e.g., `address(0)`, the
-     * account itself, or the current owner).
-     */
-    error InvalidOwner(address owner);
-
-    /**
      * @dev The caller is not authorized.
      */
     error NotAuthorized(address caller);
+
+    /**
+     * @dev The salt is invalid, the caveat was filled or manually invalidated.
+     */
+    error InvalidSalt();
 
     modifier onlyOwner() {
         _onlyOwner();
         _;
     }
 
-    constructor(IEntryPoint anEntryPoint) CustomSlotInitializable(_INITIALIZABLE_STORAGE_POSITION) {
+    constructor(IEntryPoint anEntryPoint, address factoryOwner)
+        CustomSlotInitializable(_INITIALIZABLE_STORAGE_POSITION)
+    {
         _entryPoint = anEntryPoint;
+        (, address factoryAddr) =
+            LibClone.createDeterministicERC1967(0, address(new LightAccountFactory(address(this))), bytes32(0));
+        factory = LightAccountFactory(factoryAddr);
+        factory.initialize(factoryOwner);
         _disableInitializers();
     }
 
@@ -168,16 +165,45 @@ contract LightAccount is BaseAccount, TokenCallbackHandler, UUPSUpgradeable, Cus
     }
 
     /**
-     * @notice Transfers ownership of the contract to a new account (`newOwner`).
-     * Can only be called by the current owner or from the entry point via a
-     * user operation signed by the current owner.
-     * @param newOwner The new owner
+     * @notice Execute a sequence of transactions
+     * @param validationData validationData to return from validateUserOp
+     * @param dest An array of the targets for each transaction in the sequence
+     * @param value An array of value for each transaction in the sequence
+     * @param func An array of calldata for each transaction in the sequence.
+     * Must be the same length as dest, with corresponding elements representing
+     * the parameters for each transaction.
      */
-    function transferOwnership(address newOwner) external virtual onlyOwner {
-        if (newOwner == address(0) || newOwner == address(this)) {
-            revert InvalidOwner(newOwner);
+    function executeBatchWithValidationData(
+        uint256 validationData,
+        address[] calldata dest,
+        uint256[] calldata value,
+        bytes[] calldata func
+    ) external {
+        (validationData);
+        _onlyEntryPoint();
+        if (dest.length != func.length || dest.length != value.length) {
+            revert ArrayLengthMismatch();
         }
-        _transferOwnership(newOwner);
+        uint256 length = dest.length;
+        for (uint256 i = 0; i < length;) {
+            _call(dest[i], value[i], func[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Called to validate the salt before executing the remainder of the user operation.
+     * @dev This function can be used to ensure a caveat has not been filled for the owner,
+     * during execution, by adding it to a batch operation.
+     * @param sp The SP contract to validate against
+     * @param salt The salt to validate
+     */
+    function isValidSalt(MockSP sp, bytes32 salt) external view {
+        if (MockSP(sp).invalidSalts(owner(), salt)) {
+            revert InvalidSalt();
+        }
     }
 
     /**
@@ -186,10 +212,17 @@ contract LightAccount is BaseAccount, TokenCallbackHandler, UUPSUpgradeable, Cus
      * @dev The _entryPoint member is immutable, to reduce gas consumption.  To upgrade EntryPoint,
      * a new implementation of LightAccount must be deployed with the new EntryPoint address, then upgrading
      * the implementation by calling `upgradeTo()`
-     * @param anOwner The initial owner of the account
+     * @param _owner The address that owns this account
      */
-    function initialize(address anOwner) public virtual initializer {
-        _initialize(anOwner);
+    function initialize(address _owner) public virtual initializer {
+        _initialize(_owner);
+    }
+
+    /// @inheritdoc UUPSUpgradeable
+    function _authorizeUpgrade(address) internal virtual override {
+        if (msg.sender != factory.owner()) {
+            revert NotAuthorized(msg.sender);
+        }
     }
 
     /**
@@ -267,42 +300,19 @@ contract LightAccount is BaseAccount, TokenCallbackHandler, UUPSUpgradeable, Cus
     /**
      * @dev The signature is valid if it is signed by the owner's private key
      * (if the owner is an EOA) or if it is a valid ERC-1271 signature from the
-     * owner (if the owner is a contract). Note that unlike the signature
-     * validation used in `validateUserOp`, this does **not** wrap the digest in
-     * an "Ethereum Signed Message" envelope before checking the signature in
-     * the EOA-owner case.
-     * @inheritdoc IERC1271
+     * owner (if the owner is a contract).
      */
-    function isValidSignature(bytes32 digest, bytes memory signature) public view override returns (bytes4) {
+    function isValidSignature(bytes32 digest, bytes calldata signature) public view override returns (bytes4) {
         bytes memory messageData = encodeMessageData(abi.encode(digest));
         bytes32 messageHash = keccak256(messageData);
-        if (SignatureChecker.isValidSignatureNow(owner(), messageHash, signature)) {
+        if (SignatureCheckerLib.isValidSignatureNowCalldata(owner(), messageHash, signature)) {
             return _1271_MAGIC_VALUE;
         }
         return 0xffffffff;
     }
 
-    function _initialize(address anOwner) internal virtual {
-        if (anOwner == address(0)) {
-            revert InvalidOwner(address(0));
-        }
-        _getStorage().owner = anOwner;
-        emit LightAccountInitialized(_entryPoint, anOwner);
-        emit OwnershipTransferred(address(0), anOwner);
-    }
-
-    /**
-     * @dev Transfers ownership of the contract to a new account (`newOwner`).
-     * Internal function without access restriction.
-     */
-    function _transferOwnership(address newOwner) internal virtual {
-        LightAccountStorage storage _storage = _getStorage();
-        address oldOwner = _storage.owner;
-        if (newOwner == oldOwner) {
-            revert InvalidOwner(newOwner);
-        }
-        _storage.owner = newOwner;
-        emit OwnershipTransferred(oldOwner, newOwner);
+    function _initialize(address _owner) internal virtual {
+        _getStorage().owner = _owner;
     }
 
     /*
@@ -318,15 +328,20 @@ contract LightAccount is BaseAccount, TokenCallbackHandler, UUPSUpgradeable, Cus
         override
         returns (uint256 validationData)
     {
+        bytes4 fnSelector = bytes4(userOp.callData[0:4]);
+        if (fnSelector == this.executeBatchWithValidationData.selector) {
+            validationData = uint256(bytes32(userOp.callData[4:36]));
+        }
+
+        bytes calldata signature = userOp.signature;
+        (address recovered) = userOpHash.toEthSignedMessageHash().tryRecover(signature);
+
         address _owner = owner();
-        bytes32 signedHash = userOpHash.toEthSignedMessageHash();
-        bytes memory signature = userOp.signature;
-        (address recovered, ECDSA.RecoverError error) = signedHash.tryRecover(signature);
         if (
-            (error == ECDSA.RecoverError.NoError && recovered == _owner)
-                || SignatureChecker.isValidERC1271SignatureNow(_owner, userOpHash, signature)
+            (recovered != address(0) && recovered == _owner)
+                || SignatureCheckerLib.isValidERC1271SignatureNowCalldata(_owner, userOpHash, signature)
         ) {
-            return 0;
+            return validationData;
         }
         return SIG_VALIDATION_FAILED;
     }
@@ -334,6 +349,12 @@ contract LightAccount is BaseAccount, TokenCallbackHandler, UUPSUpgradeable, Cus
     function _onlyOwner() internal view {
         //directly from EOA owner, or through the account itself (which gets redirected through execute())
         if (msg.sender != address(this) && msg.sender != owner()) {
+            revert NotAuthorized(msg.sender);
+        }
+    }
+
+    function _onlyEntryPoint() internal view {
+        if (msg.sender != address(entryPoint())) {
             revert NotAuthorized(msg.sender);
         }
     }
@@ -354,15 +375,9 @@ contract LightAccount is BaseAccount, TokenCallbackHandler, UUPSUpgradeable, Cus
         }
     }
 
-    function _authorizeUpgrade(address newImplementation) internal view override {
-        (newImplementation);
-        _onlyOwner();
-    }
-
     function _getStorage() internal pure returns (LightAccountStorage storage storageStruct) {
-        bytes32 position = _STORAGE_POSITION;
         assembly {
-            storageStruct.slot := position
+            storageStruct.slot := _STORAGE_POSITION
         }
     }
 }

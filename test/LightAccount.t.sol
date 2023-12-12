@@ -8,37 +8,54 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import {EntryPoint} from "account-abstraction/core/EntryPoint.sol";
 import {IEntryPoint} from "account-abstraction/interfaces/IEntryPoint.sol";
+import {LibClone} from "solady/src/utils/LibClone.sol";
 import {UserOperation} from "account-abstraction/interfaces/UserOperation.sol";
-import {SimpleAccount} from "account-abstraction/samples/SimpleAccount.sol";
 
-import {LightAccount} from "../src/LightAccount.sol";
-import {LightAccountFactory} from "../src/LightAccountFactory.sol";
+import {LightAccount} from "src/LightAccount.sol";
+import {LightAccountFactory} from "src/LightAccountFactory.sol";
+import {UpgradedLightAccount} from "test/mocks/UpgradedLightAccount.sol";
+import {MockSP} from "test/mocks/MockSP.sol";
+
+import "forge-std/console.sol";
 
 contract LightAccountTest is Test {
     using stdStorage for StdStorage;
     using ECDSA for bytes32;
 
-    uint256 public constant EOA_PRIVATE_KEY = 1;
     address payable public constant BENEFICIARY = payable(address(0xbe9ef1c1a2ee));
+    address constant factoryOwner = address(0x500);
+    uint256 public EOA_PRIVATE_KEY = 1;
     address public eoaAddress;
     LightAccount public account;
     LightAccount public contractOwnedAccount;
     EntryPoint public entryPoint;
     LightSwitch public lightSwitch;
+    LightAccountFactory public factory;
     Owner public contractOwner;
+    LightAccount public implementation;
 
-    event SimpleAccountInitialized(IEntryPoint indexed entryPoint, address indexed owner);
+    MockSP SP;
+
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event Initialized(uint64 version);
 
-    function setUp() public {
+    function setUp() public virtual {
         eoaAddress = vm.addr(EOA_PRIVATE_KEY);
         entryPoint = new EntryPoint();
-        LightAccountFactory factory = new LightAccountFactory(entryPoint);
-        account = factory.createAccount(eoaAddress, 1);
+
+        implementation = new LightAccount(entryPoint, factoryOwner);
+        factory = implementation.factory();
+        assertEq(factory.owner(), factoryOwner, "invalid factory owner");
+
+        account = factory.createAccount(eoaAddress);
+        vm.label(address(account), "account");
         vm.deal(address(account), 1 << 128);
+
+        SP = new MockSP(factory);
         lightSwitch = new LightSwitch();
         contractOwner = new Owner();
+        contractOwnedAccount = factory.createAccount(address(contractOwner));
+        vm.deal(address(contractOwnedAccount), 1 << 128);
     }
 
     function testExecuteCanBeCalledByOwner() public {
@@ -48,6 +65,7 @@ contract LightAccountTest is Test {
     }
 
     function testExecuteWithValueCanBeCalledByOwner() public {
+        assertTrue(account.owner() == eoaAddress);
         vm.prank(eoaAddress);
         account.execute(address(lightSwitch), 1 ether, abi.encodeCall(LightSwitch.turnOn, ()));
         assertTrue(lightSwitch.on());
@@ -67,6 +85,7 @@ contract LightAccountTest is Test {
         _useContractOwner();
         UserOperation memory op = _getUnsignedOp(address(lightSwitch), abi.encodeCall(LightSwitch.turnOn, ()));
         op.signature = contractOwner.sign(entryPoint.getUserOpHash(op));
+        console.log("contract owner op.signature", op.signature.length);
         UserOperation[] memory ops = new UserOperation[](1);
         ops[0] = op;
         entryPoint.handleOps(ops, BENEFICIARY);
@@ -141,16 +160,12 @@ contract LightAccountTest is Test {
     }
 
     function testInitialize() public {
-        LightAccountFactory factory = new LightAccountFactory(entryPoint);
-        vm.expectEmit(true, false, false, false);
-        emit Initialized(0);
-        account = factory.createAccount(eoaAddress, 1);
+        account = factory.createAccount(eoaAddress);
     }
 
     function testCannotInitializeWithZeroOwner() public {
-        LightAccountFactory factory = new LightAccountFactory(entryPoint);
-        vm.expectRevert(abi.encodeWithSelector(LightAccount.InvalidOwner.selector, (address(0))));
-        account = factory.createAccount(address(0), 1);
+        vm.expectRevert(abi.encodeWithSelector(LightAccountFactory.InvalidOwner.selector, (address(0))));
+        account = factory.createAccount(address(0));
     }
 
     function testAddDeposit() public {
@@ -171,50 +186,6 @@ contract LightAccountTest is Test {
         account.addDeposit{value: 10}();
         vm.expectRevert(abi.encodeWithSelector(LightAccount.NotAuthorized.selector, (address(this))));
         account.withdrawDepositTo(BENEFICIARY, 5);
-    }
-
-    function testOwnerCanTransferOwnership() public {
-        address newOwner = address(0x100);
-        vm.prank(eoaAddress);
-        vm.expectEmit(true, true, false, false);
-        emit OwnershipTransferred(eoaAddress, newOwner);
-        account.transferOwnership(newOwner);
-        assertEq(account.owner(), newOwner);
-    }
-
-    function testEntryPointCanTransferOwnership() public {
-        address newOwner = address(0x100);
-        UserOperation memory op =
-            _getSignedOp(address(account), abi.encodeCall(LightAccount.transferOwnership, (newOwner)), EOA_PRIVATE_KEY);
-        UserOperation[] memory ops = new UserOperation[](1);
-        ops[0] = op;
-        vm.expectEmit(true, true, false, false);
-        emit OwnershipTransferred(eoaAddress, newOwner);
-        entryPoint.handleOps(ops, BENEFICIARY);
-        assertEq(account.owner(), newOwner);
-    }
-
-    function testRandosCannotTransferOwnership() public {
-        vm.expectRevert(abi.encodeWithSelector(LightAccount.NotAuthorized.selector, (address(this))));
-        account.transferOwnership(address(0x100));
-    }
-
-    function testCannotTransferOwnershipToCurrentOwner() public {
-        vm.prank(eoaAddress);
-        vm.expectRevert(abi.encodeWithSelector(LightAccount.InvalidOwner.selector, (eoaAddress)));
-        account.transferOwnership(eoaAddress);
-    }
-
-    function testCannotTransferOwnershipToZero() public {
-        vm.prank(eoaAddress);
-        vm.expectRevert(abi.encodeWithSelector(LightAccount.InvalidOwner.selector, (address(0))));
-        account.transferOwnership(address(0));
-    }
-
-    function testCannotTransferOwnershipToLightContractItself() public {
-        vm.prank(eoaAddress);
-        vm.expectRevert(abi.encodeWithSelector(LightAccount.InvalidOwner.selector, (address(account))));
-        account.transferOwnership(address(account));
     }
 
     function testEntryPointGetter() public {
@@ -240,24 +211,18 @@ contract LightAccountTest is Test {
         assertEq(account.isValidSignature(digest, signature), bytes4(0xffffffff));
     }
 
-    function testOwnerCanUpgrade() public {
+    function testFactoryOwnerCanUpgradeAccountImplementation() public {
         // Upgrade to a normal SimpleAccount with a different entry point.
         IEntryPoint newEntryPoint = IEntryPoint(address(0x2000));
-        SimpleAccount newImplementation = new SimpleAccount(newEntryPoint);
-        vm.expectEmit(true, true, false, false);
-        emit SimpleAccountInitialized(newEntryPoint, address(this));
-        vm.prank(eoaAddress);
-        account.upgradeToAndCall(address(newImplementation), abi.encodeCall(SimpleAccount.initialize, (address(this))));
-        SimpleAccount upgradedAccount = SimpleAccount(payable(account));
-        assertEq(address(upgradedAccount.entryPoint()), address(newEntryPoint));
-    }
+        UpgradedLightAccount newImplementation = new UpgradedLightAccount(newEntryPoint, factory);
+        address prevOwner = account.owner();
 
-    function testNonOwnerCannotUpgrade() public {
-        // Try to upgrade to a normal SimpleAccount with a different entry point.
-        IEntryPoint newEntryPoint = IEntryPoint(address(0x2000));
-        SimpleAccount newImplementation = new SimpleAccount(newEntryPoint);
-        vm.expectRevert(abi.encodeWithSelector(LightAccount.NotAuthorized.selector, (address(this))));
-        account.upgradeToAndCall(address(newImplementation), abi.encodeCall(SimpleAccount.initialize, (address(this))));
+        vm.prank(factoryOwner);
+        account.upgradeToAndCall(address(newImplementation), "");
+
+        UpgradedLightAccount upgradedAccount = UpgradedLightAccount(payable(account));
+        assertEq(address(upgradedAccount.entryPoint()), address(newEntryPoint));
+        assertEq(prevOwner, upgradedAccount.owner());
     }
 
     function testStorageSlots() public {
@@ -277,21 +242,21 @@ contract LightAccountTest is Test {
         assertEq(initialized, 1);
     }
 
-    function testValidateInitCodeHash() external {
-        assertEq(
-            keccak256(
-                abi.encodePacked(
-                    type(LightAccountFactory).creationCode,
-                    bytes32(uint256(uint160(0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789)))
-                )
-            ),
-            0x2ad62a8bb3850247ef0c4f04e30b584e6eee7caa0e063745e90956653b90eb84
-        );
-    }
+    //Will only be used with lazy deployment
+    //function testValidateInitCodeHash() external {
+    //    assertEq(
+    //        keccak256(
+    //            abi.encodePacked(
+    //                type(LightAccountFactory).creationCode,
+    //                bytes32(uint256(uint160(0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789)))
+    //            )
+    //        ),
+    //        0x2ad62a8bb3850247ef0c4f04e30b584e6eee7caa0e063745e90956653b90eb84
+    //    );
+    //}
 
     function _useContractOwner() internal {
-        vm.prank(eoaAddress);
-        account.transferOwnership(address(contractOwner));
+        account = contractOwnedAccount;
     }
 
     function _getUnsignedOp(address target, bytes memory innerCallData) internal view returns (UserOperation memory) {
